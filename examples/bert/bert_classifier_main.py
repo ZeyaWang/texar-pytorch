@@ -23,9 +23,15 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-import texar.torch as tx
-
+from torch.utils.tensorboard import SummaryWriter
+import adaptdl
 from utils import model_utils
+import nni
+
+import texar.torch as tx
+import texar.torch.distributed  # pylint: disable=unused-import
+
+IS_CHIEF = int(os.getenv("ADAPTDL_RANK", "0")) == 0
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -42,11 +48,12 @@ parser.add_argument(
     help="The output directory where the model checkpoints will be written.")
 parser.add_argument(
     "--checkpoint", type=str, default=None,
-    help="Path to a model checkpoint (including bert modules) to restore from.")
+    help="Path to a model checkpoint (including bert modules) to restore from")
 parser.add_argument(
-    "--do-train", action="store_true", help="Whether to run training.")
+    "--do-train", action="store_true", default=True,
+    help="Whether to run training.")
 parser.add_argument(
-    "--do-eval", action="store_true",
+    "--do-eval", action="store_true", default=True,
     help="Whether to run eval on the dev set.")
 parser.add_argument(
     "--do-test", action="store_true",
@@ -60,16 +67,32 @@ config_downstream = {
     if not k.startswith('__') and k != "hyperparams"}
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+tuner_params = nni.get_next_parameter()
 
 logging.root.setLevel(logging.INFO)
+
+# Initialize process group with distributed training backend.
+# adaptdl.readthedocs.io/en/latest/adaptdl-pytorch.html#initializing-adaptdl
+adaptdl.torch.init_process_group("nccl" if
+            torch.cuda.is_available() else "gloo")
+
+# Get the shared path on distributed shared storage
+if adaptdl.env.share_path():  # Will be set by the AdaptDL controller
+    OUTPUT_DIR = adaptdl.env.share_path()
+else:
+    OUTPUT_DIR = args.output_dir
+
+
+tensorboard_dir = os.path.join(
+    os.getenv("ADAPTDLCTL_TENSORBOARD_LOGDIR", "/adaptdl/tensorboard"),
+    os.getenv("NNI_TRIAL_JOB_ID", "lr-adaptdl")
+)
 
 
 def main() -> None:
     """
     Builds the model and runs.
     """
-    tx.utils.maybe_create_dir(args.output_dir)
-
     # Loads data
     num_train_data = config_data.num_train_data
 
@@ -84,7 +107,7 @@ def main() -> None:
     num_warmup_steps = int(num_train_steps * config_data.warmup_proportion)
 
     # Builds learning rate decay scheduler
-    static_lr = 2e-5
+    static_lr = tuner_params['static_lr']
 
     vars_with_decay = []
     vars_without_decay = []
@@ -116,9 +139,12 @@ def main() -> None:
     test_dataset = tx.data.RecordData(hparams=config_data.test_hparam,
                                       device=device)
 
-    iterator = tx.data.DataIterator(
+    iterator = tx.distributed.AdaptiveDataIterator(
         {"train": train_dataset, "eval": eval_dataset, "test": test_dataset}
     )
+
+    # We wrap the model in AdaptiveDataParallel to make it distributed
+    model = tx.distributed.AdaptiveDataParallel(model, optim, scheduler)
 
     def _compute_loss(logits, labels):
         r"""Compute loss.
@@ -132,12 +158,13 @@ def main() -> None:
                 labels.view(-1), reduction='mean')
         return loss
 
-    def _train_epoch():
+    def _train_epoch(epoch):
         r"""Trains on the training set, and evaluates on the dev set
         periodically.
         """
         iterator.switch_to_dataset("train")
         model.train()
+        stats = adaptdl.torch.Accumulator()
 
         for batch in iterator:
             optim.zero_grad()
@@ -157,19 +184,29 @@ def main() -> None:
 
             dis_steps = config_data.display_steps
             if dis_steps > 0 and step % dis_steps == 0:
-                logging.info("step: %d; loss: %f", step, loss)
+                logging.info("epoch: %d, step: %d, loss: %.4f",
+                             epoch, step, loss)
 
-            eval_steps = config_data.eval_steps
-            if eval_steps > 0 and step % eval_steps == 0:
-                _eval_epoch()
-                model.train()
+            gain = model.gain
+            batchsize = iterator.current_batch_size
+            writer.add_scalar("Throughput/Gain", gain, epoch)
+            writer.add_scalar("Throughput/Global_Batchsize",
+                              batchsize, epoch)
+            stats["loss_sum"] += loss.item() * labels.size(0)
+            stats["total"] += labels.size(0)
+
+        with stats.synchronized():
+            stats["loss_avg"] = stats["loss_sum"] / stats["total"]
+            writer.add_scalar("Loss/Train", stats["loss_avg"], epoch)
+
 
     @torch.no_grad()
-    def _eval_epoch():
+    def _eval_epoch(epoch):
         """Evaluates on the dev set.
         """
         iterator.switch_to_dataset("eval")
         model.eval()
+        stats = adaptdl.torch.Accumulator()
 
         nsamples = 0
         avg_rec = tx.utils.AverageRecorder()
@@ -187,8 +224,22 @@ def main() -> None:
             batch_size = input_ids.size()[0]
             avg_rec.add([accu, loss], batch_size)
             nsamples += batch_size
+            stats["loss_sum"] += loss.item() * labels.size(0)
+            stats["total"] += labels.size(0)
+
         logging.info("eval accu: %.4f; loss: %.4f; nsamples: %d",
                      avg_rec.avg(0), avg_rec.avg(1), nsamples)
+        with stats.synchronized():
+            stats["loss_avg"] = stats["loss_sum"] / stats["total"]
+            writer.add_scalar("Loss/Validation", stats["loss_avg"], epoch)
+            if IS_CHIEF:
+                if epoch < config_data.max_train_epoch - 1:
+                    nni.report_intermediate_result(stats['loss_avg'], 
+                        accum=stats)
+                else:
+                    nni.report_final_result(stats['loss_avg'])
+
+
 
     @torch.no_grad()
     def _test_epoch():
@@ -208,10 +259,12 @@ def main() -> None:
 
             _all_preds.extend(preds.tolist())
 
-        output_file = os.path.join(args.output_dir, "test_results.tsv")
-        with open(output_file, "w+") as writer:
-            writer.write("\n".join(str(p) for p in _all_preds))
-        logging.info("test output written to %s", output_file)
+        if adaptdl.env.replica_rank() == 0:
+            # Only allow writes by the main replica
+            output_file = os.path.join(OUTPUT_DIR, "test_results.tsv")
+            with open(output_file, "w+") as writer:
+                writer.write("\n".join(str(p) for p in _all_preds))
+            logging.info("test output written to %s", output_file)
 
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint)
@@ -219,18 +272,28 @@ def main() -> None:
         optim.load_state_dict(ckpt['optimizer'])
         scheduler.load_state_dict(ckpt['scheduler'])
 
-    if args.do_train:
-        for _ in range(config_data.max_train_epoch):
-            _train_epoch()
-        states = {
-            'model': model.state_dict(),
-            'optimizer': optim.state_dict(),
-            'scheduler': scheduler.state_dict(),
-        }
-        torch.save(states, os.path.join(args.output_dir, 'model.ckpt'))
+    with SummaryWriter(tensorboard_dir) as writer:
+        if args.do_train:
+            # We get remaining epochs from AdaptDL in a restart-safe way.
+            for epoch in adaptdl.torch.remaining_epochs_until(
+                                         config_data.max_train_epoch):
+                _train_epoch(epoch)
 
-    if args.do_eval:
-        _eval_epoch()
+                if args.do_eval:
+                    _eval_epoch(epoch)
+
+            states = {
+                'model': model.state_dict(),
+                'optimizer': optim.state_dict(),
+                'scheduler': scheduler.state_dict(),
+            }
+
+            if adaptdl.env.replica_rank() == 0:
+                # Only allow writes by the main replica
+                torch.save(states, os.path.join(OUTPUT_DIR, 'model.ckpt'))
+
+
+
 
     if args.do_test:
         _test_epoch()
